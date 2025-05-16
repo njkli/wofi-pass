@@ -67,19 +67,25 @@ arguments_parse() {
     SEARCH_PATTERN="$*"
 }
 
-config_file_get () {
-    local -r config_base_dir="${XDG_CONFIG_HOME:-"${HOME}/.config"}"
+config_file_get() {
+  local config_dir
+  local -a candidate_files
 
-    config_files=("${WOFI_PASS_CONFIG:-""}"
-                  "${config_base_dir}/wofi-pass/config"
-                  "/etc/wofi-pass.conf")
+  config_dir="${XDG_CONFIG_HOME:-"$HOME/.config"}"
 
-    for config in "${config_files[@]}"; do
-        if [[ -n "${config}" && -f "${config}" ]]; then
-            printf "%s" "${config}"
-            return
-        fi
-    done
+  if [[ -n "${WOFI_PASS_CONFIG:-}" ]]; then
+    candidate_files+=("$WOFI_PASS_CONFIG")
+  fi
+
+  candidate_files+=("$config_dir/wofi-pass/config")
+  candidate_files+=("/etc/wofi-pass.conf")
+
+  for cfg in "${candidate_files[@]}"; do
+    if [[ -n "$cfg" && -r "$cfg" ]]; then
+      printf '%s' "$cfg"
+      return 0
+    fi
+  done
 }
 
 config_file_load () {
@@ -101,170 +107,264 @@ _trim() {
 }
 
 fields_parse() {
-    local -r passname="${1}"
+    local -r passname="$1"
     local -a entries
-    # local -A ENTRY_CACHE
-    local index entry key value
+    local entry key value
 
+    # Read password entry content
     mapfile -t entries < <(pass show "${passname}")
 
-    index=0
-    for entry in "${entries[@]}"; do
-        if [[ "$index" -eq 0 ]] && [[ "$entry" != *:* ]]; then
-            ENTRY_CACHE["password"]="$entry"
-            debug_log "Password at index[$index]: 'ENTRY_CACHE[password]=$entry'"
-        fi
+    # Process each line of the password entry
+    for index in "${!entries[@]}"; do
+        entry="${entries[index]}"
 
-        if [[ "$entry" == *": "* ]]; then
-            key=$(_trim "${entry%%: *}")
-            value=$(_trim "${entry#*: }")
-            [[ -n "$value" ]] && ENTRY_CACHE["$key"]="$value"
+        case $entry in
+            # First line password (non-key:value format)
+            *:*)
+                # Process normally in next cases
+                ;;
+            *)
+                if (( index == 0 )); then
+                    ENTRY_CACHE["password"]="$entry"
+                    debug_log "Password at index[0]: 'ENTRY_CACHE[password]=${entry}'"
+                    continue
+                fi
+                ;;
+        esac
 
-            if [[ "${key}" == "password" ]]; then
-                debug_log "Overriding ${key}: '${value}'"
-            fi
+        # Parse different entry types
+        case $entry in
+            *": "*)
+                # Key-value pairs
+                key=$(_trim "${entry%%: *}")
+                value=$(_trim "${entry#*: }")
 
-        elif [[ "$entry" == *"otpauth://"* ]]; then
-            ENTRY_CACHE["${FIELD_OTP_TAG}"]="$entry"
-            debug_log "OTP at index[$index]: '${FIELD_OTP_TAG}=$entry'"
-        else
-            debug_log "Invalid key or value at index[$index]: '$entry'"
-        fi
+                if [[ -n "${value}" ]]; then
+                    ENTRY_CACHE["${key}"]="${value}"
+                    [[ "${key}" == "password" ]] && debug_log "Overriding ${key}: '${value}'"
+                fi
+                ;;
 
-        ((index++))
+            *"otpauth://"*)
+                # OTP entries
+                ENTRY_CACHE["${FIELD_OTP_TAG}"]="${entry}"
+                debug_log "OTP at index[${index}]: '${FIELD_OTP_TAG}=${entry}'"
+                ;;
+
+            *)
+                # Invalid/unrecognized format
+                debug_log "Invalid key or value at index[${index}]: '${entry}'"
+                ;;
+        esac
     done
 
+    # Set mandatory fields
     ENTRY_CACHE["path"]="${passname}"
+    ENTRY_CACHE["autotype"]="${ENTRY_CACHE[autotype]:-$WOFI_PASS_AUTOTYPE}"
 
+    # Default username from filename
     if [[ -z "${ENTRY_CACHE[username]+x}" ]]; then
-        ENTRY_CACHE["username"]=$(basename "$passname")
-        debug_log "Not found ENTRY_CACHE[username]: '${ENTRY_CACHE["username"]}' set from filename"
+        ENTRY_CACHE["username"]=$(basename "${passname}")
+        debug_log "Set default ENTRY_CACHE[username]: '${ENTRY_CACHE["username"]}'"
     fi
 }
 
 field_get() {
-    local field lines
-    local -a wofi_args
-    local -A entry_cache skipped_keys
+    # Prepare wofi arguments and visible fields
+    local -a wofi_args=("${WOFI_PASS_ARGS[@]}")
+    local -A visible_fields hidden_fields
+    local field num_fields wofi_ret
 
-    wofi_args+=("${WOFI_PASS_ARGS[@]}")
-
-    if [[ "${FLAG_HOTKEYS_SUPPORTED}" -eq 1 ]]; then
-        [[ -n "${WOFI_PASS_HOTKEY_COPY}" ]] && wofi_args+=("--define" "key_custom_0=${WOFI_PASS_HOTKEY_COPY}")
+    # Add hotkey support if enabled
+    if (( FLAG_HOTKEYS_SUPPORTED )) && [[ -n "$WOFI_PASS_HOTKEY_COPY" ]]; then
+        wofi_args+=(--define "key_custom_0=$WOFI_PASS_HOTKEY_COPY")
     fi
 
-    if [[ ! -v ENTRY_CACHE["autotype"] ]]; then
-        ENTRY_CACHE["autotype"]="${WOFI_PASS_AUTOTYPE}"
-    fi
-
+    # Create lookup hash for hidden fields
     for item in "${WOFI_PASS_HIDE_FIELDS[@]}"; do
-        skipped_keys["$item"]=""
+        hidden_fields["$item"]=1
     done
 
-    for item in "${!ENTRY_CACHE[@]}"; do
-        [[ ! -v skipped_keys[$item] ]] && entry_cache["$item"]="${ENTRY_CACHE[$item]}"
+    # Filter visible fields
+    for field in "${!ENTRY_CACHE[@]}"; do
+        [[ ! -v hidden_fields["$field"] ]] && visible_fields["$field"]=1
     done
 
-    lines="${#entry_cache[@]}"
-    ((lines++))
-
-    if [[ "${lines}" -le 13 ]];then
-        wofi_args+=("--lines=${lines}")
+    # Configure wofi display height
+    num_fields=$(( ${#visible_fields[@]} ))
+    if (( num_fields > 0 && num_fields <= 13 )); then
+        ((num_fields++))
+        wofi_args+=(--lines "$num_fields")
     fi
 
-    field="$(printf '%s\n' "${!entry_cache[@]}" | wofi "${wofi_args[@]}")"
-    # field="$(printf '%s\n' "${!ENTRY_CACHE[@]}" | wofi "${wofi_args[@]}")"
-    wofi_ret=${?}
+    # Show selection dialog
+    field=$(printf '%s\n' "${!visible_fields[@]}" | wofi "${wofi_args[@]}")
+    wofi_ret=$?
 
+    # Log debugging information
     debug_log "wofi_selected: ${field}"
     debug_log "wofi_args: ${wofi_args[*]}"
     debug_log "wofi_ret: ${wofi_ret}"
 
-    printf "%s" "${field}"
-    return ${wofi_ret}
+    printf '%s' "$field"
+    return $wofi_ret
 }
 
 field_output() {
     local -r field="${1}"
     local -r hotkey="${2:-0}"
-    local cmd_output
+    local -a cmd
+    local otp_value
 
     debug_log "FIELD: ${field}"
     debug_log "HOTKEY: ${hotkey}"
 
-    if [[ "${hotkey}" -eq 0 ]]; then
-        cmd_output=("wtype")
-    elif [[ "${hotkey}" -eq 10 ]]; then
-        cmd_output=("wl-copy")
-    fi
+    # Determine output command based on hotkey
+    case "${hotkey}" in
+        0)   cmd=(wtype) ;;
+        10)  cmd=(wl-copy) ;;
+        *)   debug_log "Unknown hotkey: ${hotkey}"; return 1 ;;
+    esac
 
-    if [[ "${field}" == "autotype" ]]; then
-        autotype_output
-    elif [[ "${field}" == "${FIELD_OTP_TAG}" ]]; then
-        cmd_output+=("$(pass otp "${ENTRY_CACHE["path"]}" | head -n1)")
-        "${cmd_output[@]}"
-    else
-        "${cmd_output[@]}" "${ENTRY_CACHE["${field}"]}"
-    fi
+    case "${field}" in
+        "autotype")
+            autotype_output
+            return $?
+            ;;
+
+        "${FIELD_OTP_TAG}")
+            # Get OTP value safely
+            otp_value=$(pass otp "${ENTRY_CACHE[path]}" | head -n1)
+            if [[ -n "${otp_value}" ]]; then
+                "${cmd[@]}" "${otp_value}"
+            else
+                debug_log "Failed to get OTP value"
+                return 1
+            fi
+            ;;
+
+        *)
+            # Handle regular field output
+            if [[ -v ENTRY_CACHE["${field}"] ]]; then
+                "${cmd[@]}" "${ENTRY_CACHE[${field}]}"
+            else
+                debug_log "Missing field in cache: ${field}"
+                return 1
+            fi
+            ;;
+    esac
 }
 
 autotype_output() {
     local -a wtype_args
+    local word special_value
+    local -r path="${ENTRY_CACHE[path]}"
 
-    for word in ${ENTRY_CACHE["autotype"]}; do
+    # Split autotype string while preserving quoted strings
+    IFS=' ' read -ra words <<< "${ENTRY_CACHE[autotype]}"
+
+    for word in "${words[@]}"; do
         case "${word}" in
-            ":tab") wtype_args+=("-k" "Tab");;
-            ":space") wtype_args+=("-k" "space");;
-            ":enter") wtype_args+=("-k" "Return");;
-            ":delay") wtype_args+=("-s" "$((WOFI_PASS_DELAY * 1000))");;
-            ":otp") wtype_args+=("$(pass otp "${ENTRY_CACHE["path"]}" | head -n1)");;
-            ":password" | "pass") wtype_args+=("${ENTRY_CACHE["password"]}");;
-            ":username" | "user" | "uname") wtype_args+=("${ENTRY_CACHE["username"]}");;
-            ":path") wtype_args+=("${ENTRY_CACHE["path"]}");;
-            *) wtype_args+=("${ENTRY_CACHE["${word}"]}")
+            ":tab")
+                wtype_args+=("-k" "Tab")
+                debug_log "Autotype: Tab key"
+                ;;
+            ":space")
+                wtype_args+=("-k" "space")
+                debug_log "Autotype: Space key"
+                ;;
+            ":enter")
+                wtype_args+=("-k" "Return")
+                debug_log "Autotype: Enter key"
+                ;;
+            ":delay")
+                wtype_args+=("-s" "$((WOFI_PASS_DELAY * 1000))")
+                debug_log "Autotype: Delay ${WOFI_PASS_DELAY}s"
+                ;;
+            ":otp")
+                special_value=$(pass otp "${path}" | head -n1)
+                if [[ -n "${special_value}" ]]; then
+                    wtype_args+=("${special_value}")
+                    debug_log "Autotype: OTP value"
+                else
+                    debug_log "Autotype: Failed to get OTP value"
+                    return 1
+                fi
+                ;;
+            ":password"|"pass")
+                wtype_args+=("${ENTRY_CACHE[password]}")
+                debug_log "Autotype: Password field"
+                ;;
+            ":username"|"user"|"uname")
+                wtype_args+=("${ENTRY_CACHE[username]}")
+                debug_log "Autotype: Username field"
+                ;;
+            ":path")
+                wtype_args+=("${path}")
+                debug_log "Autotype: Path field"
+                ;;
+            *)
+                if [[ -v ENTRY_CACHE["${word}"] ]]; then
+                    wtype_args+=("${ENTRY_CACHE[${word}]}")
+                    debug_log "Autotype: Field '${word}'"
+                else
+                    debug_log "Autotype: Unknown keyword '${word}'"
+                    return 1
+                fi
+                ;;
         esac
     done
 
-    wtype "${wtype_args[@]}"
+    # Execute the composed wtype command
+    if [[ "${#wtype_args[@]}" -gt 0 ]]; then
+        debug_log "Executing wtype with arguments: ${wtype_args[*]}"
+        wtype "${wtype_args[@]}"
+    else
+        debug_log "No autotype arguments generated"
+        return 1
+    fi
 }
 
 passname_select() {
     local -r pass_dir="${PASSWORD_STORE_DIR}"
-    local all_files password_files passname
-    local wofi_args=()
+    local -a wofi_args
+    local all_files password_files passname line_count
 
-    wofi_args+=("${WOFI_PASS_ARGS[@]}")
-    all_files="$(find "${pass_dir}" -name "*.gpg" \
-                 | sed "s|^${pass_dir}/\(.*\)\.gpg$|\1|" )"
+    # Generate list of password entries
+    all_files=$(find "${pass_dir}" -name '*.gpg' -printf '%P\n' | sed 's/\.gpg$//')
 
-    if [[ -n "${SEARCH_PATTERN}" ]]; then
-        password_files="$(printf '%s\n' "${all_files}" \
-            | grep -iF "${SEARCH_PATTERN}" \
-            | sort)"
+    # Filter and sort entries
+    password_files=$(
+        if [[ -n "${SEARCH_PATTERN}" ]]; then
+            grep -iF "${SEARCH_PATTERN}" <<< "${all_files}"
+        else
+            echo "${all_files}"
+        fi | sort
+    )
 
-        password_files_lines=$(echo "${password_files}" | wc -l)
-        ((password_files_lines++))
-
-        if [[ "${password_files_lines}" -le 13 ]];then
-            wofi_args+=("--lines=${password_files_lines}")
-        fi
-
-    else
-        password_files="$(printf '%s\n' "${all_files}" | sort)"
+    # Fallback to all files if search returns nothing
+    if [[ -z "${password_files}" ]]; then
+        password_files=$(echo "${all_files}" | sort)
     fi
 
-    readonly password_files
-
-    if [[ "${WOFI_PASS_CASE_INSENSITIVE}" -eq 1 ]]; then
-        wofi_args+=("--insensitive")
+    # Configure wofi display lines
+    wofi_args=("${WOFI_PASS_ARGS[@]}")
+    line_count=$(wc -l <<< "${password_files}")
+    if (( line_count > 0 && line_count <= 13 )); then
+        ((line_count++))
+        wofi_args+=(--lines "${line_count}")
     fi
 
-    passname="$(printf '%s\n' "${password_files}" | wofi "${wofi_args[@]}")"
+    # Add case insensitivity if configured
+    [[ "${WOFI_PASS_CASE_INSENSITIVE}" -eq 1 ]] && wofi_args+=(--insensitive)
+
+    # Select entry with wofi
+    passname=$(wofi "${wofi_args[@]}" <<< "${password_files}")
 
     debug_log "wofi_selected: ${passname}"
     debug_log "wofi_args: ${wofi_args[*]}"
 
-    printf "%s" "${passname}"
+    printf '%s' "${passname}"
 }
 
 main() {
@@ -295,7 +395,7 @@ main() {
         debug_log "Selected: '${passname}'"
         debug_log "<-= ENTRY_CACHE[@] =->"
         for key in "${!ENTRY_CACHE[@]}"; do
-            debug_log "${key}: ${ENTRY_CACHE[$key]}"
+            debug_log "${key}: '${ENTRY_CACHE[$key]}'"
         done
         debug_log "<-= ENTRY_CACHE[@] =->"
     fi
